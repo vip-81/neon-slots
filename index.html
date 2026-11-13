@@ -942,7 +942,7 @@ body {
   <div class="modal">
     <div class="modal-header">
       <h2 class="modal-title" id="paytable-title">赔付表 PAYTABLE</h2>
-      <button class="modal-close" id="btn-close-paytable" aria-label="关闭">×</button>
+      <button class="modal-close" id="btn-close-paytable" aria-label="× 关闭">×</button>
     </div>
     <div class="payout-table" id="payout-table"></div>
   </div>
@@ -1272,30 +1272,52 @@ body {
 
     async init() {
       if (this.db) return;
-      
+      if (this.initFailed) { this.useIndexedDB = false; return; }
+
       if ('indexedDB' in window) {
         try {
-          this.db = await this.openDB();
+          // 双保险：openDB 自带超时，外层再包一层，绝不永久 pending
+          this.db = await Promise.race([
+            this.openDB(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('IndexedDB init timeout')), 1000))
+          ]);
           this.useIndexedDB = true;
           return;
         } catch {
           // 回退到 localStorage
         }
       }
+      this.initFailed = true;
       this.useIndexedDB = false;
     },
 
     openDB() {
       return new Promise((resolve, reject) => {
-        const request = indexedDB.open(this.DB_NAME, 1);
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
-        request.onupgradeneeded = (event) => {
-          const db = event.target.result;
-          if (!db.objectStoreNames.contains(this.STORE_NAME)) {
-            db.createObjectStore(this.STORE_NAME, { keyPath: 'key' });
-          }
+        let settled = false;
+        let timer = null;
+        const finish = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          fn(value);
         };
+        // 另一个标签页持有旧版本连接时只触发 blocked，
+        // 若不处理，Promise 永远 pending，会拖死初始化链。
+        timer = setTimeout(() => finish(reject, new Error('IndexedDB open timeout')), 1000);
+        try {
+          const request = indexedDB.open(this.DB_NAME, 1);
+          request.onblocked = () => finish(reject, new Error('IndexedDB blocked'));
+          request.onerror = () => finish(reject, request.error);
+          request.onsuccess = () => finish(resolve, request.result);
+          request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+              db.createObjectStore(this.STORE_NAME, { keyPath: 'key' });
+            }
+          };
+        } catch (e) {
+          finish(reject, e);
+        }
       });
     },
 
@@ -1492,7 +1514,11 @@ body {
         this.setupMessageListener();
 
         if (!this.isNative) {
-          await this.storageFallback.init();
+          // 存储初始化也必须有时限，否则 initPromise 卡住会连累所有 sendRequest
+          await Promise.race([
+            this.storageFallback.init().catch(() => {}),
+            new Promise(resolve => setTimeout(resolve, 1200))
+          ]);
           this.audioFallback.init();
         }
 
@@ -1540,7 +1566,11 @@ body {
     }
 
     async sendRequest(namespace, method, payload, options = {}) {
-      await this.initialize();
+      // initialize 自身也可能被挂起，外层再加一道硬超时
+      await Promise.race([
+        this.initialize().catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 1500))
+      ]);
 
       const requestId = generateRequestId();
       const timeout = options.timeout ?? this.defaultTimeout;
@@ -1556,7 +1586,14 @@ body {
       };
 
       if (!this.isNative) {
-        return this.executeFallback(namespace, method, payload);
+        // 降级实现同样要有硬超时：IndexedDB 事务异常时不能让调用方永久等待
+        return Promise.race([
+          this.executeFallback(namespace, method, payload),
+          new Promise(resolve => setTimeout(() => resolve({
+            type: 'response', requestId, timestamp: Date.now(), success: false,
+            error: { code: 'FALLBACK_TIMEOUT', message: 'Fallback execution timed out' }
+          }), 1500))
+        ]);
       }
 
       return new Promise((resolve, reject) => {
@@ -2028,6 +2065,37 @@ const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const randFloat = (min, max) => Math.random() * (max - min) + min;
 
+/**
+ * 硬超时包装：任何异步调用都不得让游戏逻辑无限等待。
+ * 超时后返回 fallback，而不是让 Promise 永久 pending。
+ */
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise(resolve => setTimeout(() => resolve(fallback), ms))
+  ]);
+}
+
+/** 音效：fire-and-forget，绝不阻塞旋转、结算或界面切换 */
+function sfx(id, config) {
+  if (!bridge) return;
+  withTimeout(bridge.playAudio(id, config || {}), 800, false).catch(() => {});
+}
+
+/** 震动：fire-and-forget */
+function haptic(type) {
+  if (!bridge) return;
+  withTimeout(bridge.vibrate(type), 800, false).catch(() => {});
+}
+
+// 只读诊断钩子，便于 QA 与用户自检（纯前端演示，无敏感数据）
+window.__NEON_SLOTS__ = {
+  ready: false,
+  get state() { return state; },
+  get bridgeReady() { return bridgeReady; },
+  get bridge() { return bridge; }
+};
+
 /* 加权随机选择符号索引 */
 function pickSymbolIndex() {
   const totalWeight = SYMBOLS.reduce((sum, s) => sum + s.weight, 0);
@@ -2048,43 +2116,44 @@ function generateReelStrip(length = 30) {
 let bridge = null;
 let bridgeReady = false;
 
-/** 初始化 Bridge */
+/**
+ * 初始化 Bridge —— 完全后台执行，不参与 UI 启动流程。
+ * 每一段都有硬超时：即使原生桥接不可用、IndexedDB 被 block 或存储异常，
+ * 游戏本体也必须照常可玩。
+ */
 async function initBridge() {
   bridge = window.HybridBridge.getInstance();
-  await bridge.initialize();
+  await withTimeout(bridge.initialize(), 1500, null);
   bridgeReady = true;
-
-  // 更新连接状态显示
   updateConnectionStatus();
 
-  // 监听应用状态变化
-  bridge.onAppStateChange((state) => {
-    console.log('[Game] App state:', state);
-    if (state === 'background' && state.autoSpin) {
-      // 切后台暂停自动旋转
+  // 回调参数不能叫 state，否则会遮蔽游戏状态对象；
+  // 严格模式下给字符串赋属性还会抛 TypeError。
+  bridge.onAppStateChange((appState) => {
+    if (appState === 'background' && state.autoSpin) {
       state.autoSpin = false;
       updateUI();
     }
   });
+  bridge.onNetworkChange(() => updateConnectionStatus());
 
-  // 监听网络状态变化
-  bridge.onNetworkChange((online, type) => {
-    console.log('[Game] Network:', online, type);
-    updateConnectionStatus();
-  });
-
-  // 预加载关键音频
-  await Promise.all([
-    bridge.preloadAudio(window.AUDIO_IDS.SPIN, '/audio/spin.mp3'),
-    bridge.preloadAudio(window.AUDIO_IDS.REEL_STOP, '/audio/reel-stop.mp3'),
-    bridge.preloadAudio(window.AUDIO_IDS.WIN_SMALL, '/audio/win-small.mp3'),
-    bridge.preloadAudio(window.AUDIO_IDS.WIN_BIG, '/audio/win-big.mp3'),
-    bridge.preloadAudio(window.AUDIO_IDS.LOSE, '/audio/lose.mp3'),
-    bridge.preloadAudio(window.AUDIO_IDS.CLICK, '/audio/click.mp3'),
+  // 音频预加载：后台 + 超时，不阻塞
+  Promise.allSettled([
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.SPIN, '/audio/spin.mp3'), 1000, false),
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.REEL_STOP, '/audio/reel-stop.mp3'), 1000, false),
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.WIN_SMALL, '/audio/win-small.mp3'), 1000, false),
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.WIN_BIG, '/audio/win-big.mp3'), 1000, false),
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.LOSE, '/audio/lose.mp3'), 1000, false),
+    withTimeout(bridge.preloadAudio(window.AUDIO_IDS.CLICK, '/audio/click.mp3'), 1000, false),
   ]).catch(() => {});
 
-  // 从 Bridge 存储加载状态
-  await loadStateFromBridge();
+  // 存档恢复：后台 + 超时，且绝不在用户已经开始游玩后覆盖余额
+  try {
+    await withTimeout(loadStateFromBridge(), 1500, null);
+    if (state.spins === 0 && !state.isSpinning) updateUI();
+  } catch (err) {
+    console.warn('[Game] state restore skipped:', err);
+  }
 }
 
 /** 更新连接状态 UI */
@@ -2111,10 +2180,11 @@ function updateConnectionStatus() {
   }
 }
 
-/** 从 Bridge 存储加载状态 */
+/** 从 Bridge 存储加载状态（仅在玩家尚未开始本局时生效） */
 async function loadStateFromBridge() {
+  // 后台恢复不能覆盖用户已经进行的游戏
+  if (state.spins > 0 || state.isSpinning) return;
   try {
-    // 尝试从新存储加载
     const saved = await bridge.storageGet(FULL_STORAGE_KEY);
     if (saved) {
       state.balance = saved.balance ?? INITIAL_BALANCE;
@@ -2124,7 +2194,7 @@ async function loadStateFromBridge() {
       if (!BET_OPTIONS.includes(state.bet)) state.bet = 25;
       return;
     }
-    
+
     // 兼容旧版本 localStorage
     const oldSaved = localStorage.getItem(FULL_STORAGE_KEY);
     if (oldSaved) {
@@ -2134,27 +2204,22 @@ async function loadStateFromBridge() {
       state.totalWin = data.totalWin ?? 0;
       state.spins = data.spins ?? 0;
       if (!BET_OPTIONS.includes(state.bet)) state.bet = 25;
-      // 迁移到新存储
-      await saveStateToBridge();
-      return;
+      saveStateToBridge();
     }
   } catch (e) {
     console.warn('加载存档失败', e);
   }
 }
 
-/** 保存状态到 Bridge 存储 */
-async function saveStateToBridge() {
-  try {
-    await bridge.storageSet(FULL_STORAGE_KEY, {
-      balance: state.balance,
-      bet: state.bet,
-      totalWin: state.totalWin,
-      spins: state.spins,
-    });
-  } catch (e) {
-    console.warn('保存存档失败', e);
-  }
+/** 保存状态：fire-and-forget + 硬超时，绝不阻塞任何游戏逻辑 */
+function saveStateToBridge() {
+  if (!bridge) return;
+  withTimeout(bridge.storageSet(FULL_STORAGE_KEY, {
+    balance: state.balance,
+    bet: state.bet,
+    totalWin: state.totalWin,
+    spins: state.spins,
+  }), 1200, false).catch(() => {});
 }
 
 /* ---------- 6. 符号渲染（Canvas 绘制精美图标）---------- */
@@ -2473,7 +2538,10 @@ function updateUI() {
   });
 
   els.btnSpin.disabled = state.isSpinning || state.balance < state.bet;
-  els.spinText.textContent = state.isSpinning ? 'STOP' : 'SPIN';
+  const spinLabel = state.isSpinning ? 'STOP' : 'SPIN';
+  els.spinText.textContent = spinLabel;
+  // accessible name 必须包含可见文本，否则触发 label-content-name-mismatch
+  els.btnSpin.setAttribute('aria-label', spinLabel + (state.isSpinning ? ' — 停止旋转轮盘' : ' — 旋转轮盘'));
   els.btnSpin.classList.toggle('spinning', state.isSpinning);
 
   els.autoSwitch.classList.toggle('active', state.autoSpin);
@@ -2532,24 +2600,23 @@ function evaluateWin(resultMatrix) {
   return { totalWin, winningLines, winningSymbols };
 }
 
-async function startSpin() {
+function startSpin() {
   if (state.isSpinning) return;
   if (state.balance < state.bet) {
     triggerTopUp();
     return;
   }
 
-  // 触觉反馈：轻微震动
-  await bridge.vibrate(window.HAPTIC_TYPES.LIGHT);
+  // 反馈类调用一律非阻塞，先完成核心游戏状态更新
+  haptic(window.HAPTIC_TYPES.LIGHT);
 
-  // 扣除下注
   state.balance -= state.bet;
   state.win = 0;
   state.winningLines = [];
   state.winningSymbols.clear();
   state.isSpinning = true;
   state.spins++;
-  await saveStateToBridge();
+  saveStateToBridge();
   updateUI();
 
   const resultMatrix = computeSpinResult();
@@ -2562,8 +2629,7 @@ async function startSpin() {
     state.stripVelocities[r] = randFloat(25, 35);
   }
 
-  // 播放旋转音效
-  await bridge.playAudio(window.AUDIO_IDS.SPIN);
+  sfx(window.AUDIO_IDS.SPIN);
 }
 
 function stopSpin() {
@@ -2577,28 +2643,28 @@ function stopSpin() {
   finishSpin();
 }
 
-async function finishSpin() {
+function finishSpin() {
   const { totalWin, winningLines, winningSymbols } = evaluateWin(state.lastResultMatrix);
   state.win = totalWin;
   state.winningLines = winningLines;
   state.winningSymbols = winningSymbols;
   state.balance += totalWin;
   state.totalWin += totalWin;
-  await saveStateToBridge();
+  saveStateToBridge();
 
   updateUI();
 
   if (totalWin > 0) {
     // 触觉反馈：根据胜利等级
     if (totalWin >= state.bet * 50) {
-      await bridge.vibrate(window.HAPTIC_TYPES.SUCCESS);
+      haptic(window.HAPTIC_TYPES.SUCCESS);
     } else if (totalWin >= state.bet * 20) {
-      await bridge.vibrate(window.HAPTIC_TYPES.MEDIUM);
+      haptic(window.HAPTIC_TYPES.MEDIUM);
     } else {
-      await bridge.vibrate(window.HAPTIC_TYPES.LIGHT);
+      haptic(window.HAPTIC_TYPES.LIGHT);
     }
 
-    await bridge.playAudio(
+    sfx(
       totalWin >= state.bet * 50 ? window.AUDIO_IDS.WIN_MEGA :
       totalWin >= state.bet * 20 ? window.AUDIO_IDS.WIN_BIG :
       window.AUDIO_IDS.WIN_SMALL
@@ -2606,8 +2672,8 @@ async function finishSpin() {
     triggerWinCelebration(totalWin);
     launchParticles('win');
   } else {
-    await bridge.vibrate(window.HAPTIC_TYPES.ERROR);
-    await bridge.playAudio(window.AUDIO_IDS.LOSE);
+    haptic(window.HAPTIC_TYPES.ERROR);
+    sfx(window.AUDIO_IDS.LOSE);
   }
 
   if (state.balance < Math.min(...BET_OPTIONS)) {
@@ -2644,7 +2710,7 @@ function updateSpinAnimation(now) {
       state.stripVelocities[r] = 0;
       state.reelsStopped[r] = true;
 
-      setTimeout(() => bridge.playAudio(window.AUDIO_IDS.REEL_STOP), r * 80);
+      setTimeout(() => sfx(window.AUDIO_IDS.REEL_STOP), r * 80);
     } else {
       allStopped = false;
       const remaining = target - current;
@@ -2668,15 +2734,15 @@ function updateSpinAnimation(now) {
 }
 
 /* ---------- 10. 补币机制 ---------- */
-async function triggerTopUp() {
+function triggerTopUp() {
   if (state.balance >= MIN_BALANCE_FOR_TOPUP) return;
   const added = TOPUP_AMOUNT;
   state.balance += added;
-  await saveStateToBridge();
+  saveStateToBridge();
   updateUI();
   showToast(`筹码不足，赠送 ${fmtNum(added)} 筹码！`, 'info');
-  await bridge.playAudio(window.AUDIO_IDS.COIN);
-  await bridge.vibrate(window.HAPTIC_TYPES.WARNING);
+  sfx(window.AUDIO_IDS.COIN);
+  haptic(window.HAPTIC_TYPES.WARNING);
 }
 
 /* ---------- 11. 大奖庆祝 ---------- */
@@ -2868,25 +2934,26 @@ function getSymbolChar(id) {
 
 /* ---------- 15. 事件绑定 ---------- */
 function bindEvents() {
-  els.btnStart.addEventListener('click', async () => {
-    await bridge.playAudio(window.AUDIO_IDS.CLICK);
+  // 所有 handler 保持同步：先切界面/改状态，音效与存档放后台
+  els.btnStart.addEventListener('click', () => {
+    sfx(window.AUDIO_IDS.CLICK);
     switchScreen('game');
   });
 
-  els.btnQuit.addEventListener('click', async () => {
-    await bridge.playAudio(window.AUDIO_IDS.CLICK);
+  els.btnQuit.addEventListener('click', () => {
+    sfx(window.AUDIO_IDS.CLICK);
     if (state.autoSpin) toggleAutoSpin();
     switchScreen('start');
   });
 
   els.betBtns.forEach(btn => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
       if (state.isSpinning) return;
       const bet = parseInt(btn.dataset.bet, 10);
       if (state.balance >= bet) {
-        await bridge.playAudio(window.AUDIO_IDS.CLICK);
+        sfx(window.AUDIO_IDS.CLICK);
         state.bet = bet;
-        await saveStateToBridge();
+        saveStateToBridge();
         updateUI();
       }
     });
@@ -2900,8 +2967,8 @@ function bindEvents() {
     }
   });
 
-  els.autoSwitch.addEventListener('click', async () => {
-    await bridge.playAudio(window.AUDIO_IDS.CLICK);
+  els.autoSwitch.addEventListener('click', () => {
+    sfx(window.AUDIO_IDS.CLICK);
     toggleAutoSpin();
   });
 
@@ -2928,7 +2995,7 @@ function bindEvents() {
           const idx = parseInt(e.code.slice(-1), 10) - 1;
           const bet = BET_OPTIONS[idx];
           if (bet && state.balance >= bet) {
-            bridge.playAudio(window.AUDIO_IDS.CLICK);
+            sfx(window.AUDIO_IDS.CLICK);
             state.bet = bet;
             saveStateToBridge();
             updateUI();
@@ -2995,19 +3062,23 @@ function gameLoop(time) {
 }
 
 /* ---------- 17. 初始化 ---------- */
-async function init() {
-  await initBridge();
-  
+function init() {
+  // 关键修复：UI 初始化必须同步完成，绝不等待 Bridge。
+  // 旧实现把 bindEvents() 放在 await initBridge() 之后，冷启动期间
+  // 所有按钮都没有事件监听，用户点击「开始游戏 / SPIN」会完全没反应。
   createReelCanvases();
   initReelStrips();
   renderAllReels();
   bindEvents();
   updateUI();
-
   drawParticles();
   requestAnimationFrame(gameLoop);
+  window.__NEON_SLOTS__.ready = true;
 
-  console.log('NEON SLOTS (with Hybrid Bridge) 初始化完成');
+  // Bridge 完全后台化：失败、超时、被 blocked 都不影响游戏
+  initBridge().catch(err => console.warn('[Game] Bridge init skipped:', err));
+
+  console.log('NEON SLOTS 初始化完成');
 }
 
 if (document.readyState === 'loading') {
