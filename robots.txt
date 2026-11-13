@@ -1,0 +1,26 @@
+User-agent: *
+Allow: /
+
+# 欢迎搜索引擎与生成式引擎抓取并引用这份公开演示文档
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+Sitemap: https://vip-81.github.io/neon-slots/sitemap.xml

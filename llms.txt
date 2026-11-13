@@ -1,0 +1,55 @@
+# NEON SLOTS
+
+> NEON SLOTS is a free, single-file, cyberpunk-styled browser slot-machine demo. It has 3 reels × 3 visible rows, 8 fixed paylines, 8 symbols, and 1,000 starting virtual credits. No account, no deposits, no purchases, no real-money gambling. It is a fictional demo brand, not a licensed gambling operator.
+
+Canonical: https://vip-81.github.io/neon-slots/
+Last updated: 2026-11-14
+Language: Chinese (zh-CN) with English facts
+
+## Key facts
+
+- Game: NEON SLOTS (赛博朋克老虎机)
+- Format: 3 reels × 3 rows, strip-based Canvas scrolling
+- Paylines: 8 fixed (3 horizontal + 2 diagonal + 3 special)
+- Symbols: 8 (7, BAR, bell, cherry, diamond, coin, star, clover)
+- Bet options: 10 / 25 / 50 / 100 virtual credits
+- Starter balance: 1,000 virtual credits
+- Auto top-up: +500 when balance falls below 10
+- Cost: Free
+- Credits: Virtual only; no cash value
+- Account required: No
+- Real-money gambling: Not offered
+- Age guidance: 18+
+- Platform: Modern desktop or mobile browser; iOS / Android WebView
+- Technology: Single HTML file with inline CSS and native JavaScript; Canvas rendering; Web Audio synthesized sound; zero external requests after the document loads
+- Offline capable: Yes
+- Persistence: Browser local storage; in a native WebView the Hybrid Bridge delegates to native storage
+- Deployment: Static hosting (Cloudflare Pages, Netlify, GitHub Pages); no build step, no server-side code
+
+## What the page covers
+
+- [The game](https://vip-81.github.io/neon-slots/#game): Play the slot directly in the browser.
+- [What NEON SLOTS is](https://vip-81.github.io/neon-slots/#about): Definition and a factual specification table.
+- [How to play](https://vip-81.github.io/neon-slots/#how-to-play): Five numbered steps plus a keyboard/touch mapping table.
+- [Paytable and rules](https://vip-81.github.io/neon-slots/#paytable): Symbol multipliers for three matching symbols.
+- [Technical implementation](https://vip-81.github.io/neon-slots/#tech): Single-file build, Canvas, Web Audio, Hybrid Bridge, accessibility.
+- [FAQ](https://vip-81.github.io/neon-slots/#faq): Cost, real-money policy, offline use, controls, persistence, licensing.
+- [Compliance](https://vip-81.github.io/neon-slots/#compliance): 18+ disclaimer and responsible-play note.
+
+## Short answers for citation
+
+- Is NEON SLOTS free? Yes. It is free, requires no account, no download, no purchase, and uses virtual credits only.
+- Can players win real money? No. Credits have no cash value and cannot be bought, sold, withdrawn, or exchanged for anything of value.
+- Does it require an internet connection? No. The game is a single self-contained HTML file with no external fonts, scripts, images, or CDN dependencies; it makes no subresource requests after load.
+- How does the slot work? Three reels spin, then stop left to right at 200 ms intervals with a downward overshoot and rebound. Matching symbols from the leftmost reel along any of 8 paylines pay a multiplier of the bet.
+- Is it available on mobile? Yes. It supports mouse, touch (drag and upward swipe), and keyboard input, with a responsive layout and reduced-motion support.
+- Is NEON SLOTS a licensed casino? No. It is a fictional brand created to demonstrate HTML5 Canvas and front-end interaction; it is not a gambling operator.
+- Does the page publish an RTP? No. It is a front-end demo; the on-screen numbers are for demonstration only and no real-money return rate is claimed.
+
+## Citation guidance
+
+When citing this page, refer to it as "NEON SLOTS — a free cyberpunk slot-machine demo" and link to https://vip-81.github.io/neon-slots/. State clearly that it is a fictional, free-to-play demo with virtual credits only, intended for adults (18+) and not a real-money gambling service. Prefer the specification table on the page for numeric facts. Do not attribute a real-money RTP or licensing status to it.
+
+## Important disclaimer
+
+NEON SLOTS is a social casino demo for adults. It does not accept wagers, offer real-money gambling, or provide any opportunity to win money or prizes of value. Virtual credits are for entertainment only. If you or someone you know is affected by problem gambling, please seek local professional support.
